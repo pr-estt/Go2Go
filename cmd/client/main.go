@@ -183,9 +183,11 @@ func (c *client) upload(local, remote string) error {
 	if _, err := c.cmd("UPLOAD %s %d %s", remote, size, hex.EncodeToString(h.Sum(nil))); err != nil {
 		return err
 	}
-	if _, err := io.CopyN(c.conn, f, size); err != nil {
+	pw := &progress{label: "uploading", total: size, start: time.Now()}
+	if _, err := io.CopyN(io.MultiWriter(c.conn, pw), f, size); err != nil {
 		return err
 	}
+	pw.done()
 	// Second OK = file stored and checksum verified.
 	_, err = c.readStatus()
 	if err == nil {
@@ -216,9 +218,11 @@ func (c *client) download(remote, local string) error {
 	defer tmp.Close()
 
 	h := sha256.New()
-	if _, err := io.CopyN(io.MultiWriter(tmp, h), c.r, size); err != nil {
+	pw := &progress{label: "downloading", total: size, start: time.Now()}
+	if _, err := io.CopyN(io.MultiWriter(tmp, h, pw), c.r, size); err != nil {
 		return err
 	}
+	pw.done()
 	if hex.EncodeToString(h.Sum(nil)) != wantSum {
 		return errors.New("checksum mismatch, download discarded")
 	}
@@ -233,6 +237,39 @@ func (c *client) download(remote, local string) error {
 	}
 	fmt.Printf("downloaded %s to %s (%d bytes)\n", remote, local, size)
 	return nil
+}
+
+// progress is an io.Writer that prints a simple progress line to stderr.
+type progress struct {
+	label string
+	total int64
+	n     int64
+	start time.Time
+	last  time.Time
+}
+
+func (p *progress) Write(b []byte) (int, error) {
+	p.n += int64(len(b))
+	if time.Since(p.last) > 200*time.Millisecond {
+		p.last = time.Now()
+		p.print()
+	}
+	return len(b), nil
+}
+
+func (p *progress) print() {
+	pct := 100.0
+	if p.total > 0 {
+		pct = float64(p.n) * 100 / float64(p.total)
+	}
+	rate := float64(p.n) / 1024 / 1024 / (time.Since(p.start).Seconds() + 1e-9)
+	fmt.Fprintf(os.Stderr, "\r%s: %5.1f%%  %.1f MiB/s", p.label, pct, rate)
+}
+
+func (p *progress) done() {
+	p.n = p.total
+	p.print()
+	fmt.Fprintln(os.Stderr)
 }
 
 func parseSize(fields []string, i int) (int64, error) {
