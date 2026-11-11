@@ -21,6 +21,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -208,6 +209,8 @@ func (s *Server) handle(raw net.Conn) {
 
 		var herr error // non-nil means the connection is unusable
 		switch cmd {
+		case "LIST":
+			herr = c.cmdList()
 		case "QUIT":
 			c.reply("OK")
 			return
@@ -241,4 +244,29 @@ func (c *session) reply(format string, a ...any) error {
 func (c *session) errf(format string, a ...any) error {
 	msg := strings.ReplaceAll(fmt.Sprintf(format, a...), "\n", " ")
 	return c.reply("ERR %s", msg)
+}
+
+func (c *session) cmdList() error {
+	entries, err := os.ReadDir(c.srv.cfg.dir)
+	if err != nil {
+		return c.errf("cannot list files")
+	}
+	var lines []string
+	for _, e := range entries {
+		if !e.Type().IsRegular() || strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("%s\t%d\n", e.Name(), info.Size()))
+	}
+	sort.Strings(lines)
+	payload := strings.Join(lines, "")
+	if err := c.reply("OK %d", len(payload)); err != nil {
+		return err
+	}
+	_, err = io.WriteString(c.w, payload)
+	return err
 }
