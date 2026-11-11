@@ -220,6 +220,8 @@ func (s *Server) handle(raw net.Conn) {
 			herr = c.cmdUpload(args)
 		case "DOWNLOAD":
 			herr = c.cmdDownload(args)
+		case "DELETE":
+			herr = c.cmdDelete(args)
 		case "QUIT":
 			c.reply("OK")
 			return
@@ -387,4 +389,15 @@ func (c *session) cmdDownload(args []string) error {
 	}
 	log.Printf("[%s] downloaded %s (%d bytes)", c.remote, args[0], n)
 	return nil
+}
+
+func (c *session) cmdDelete(args []string) error {
+	if len(args) != 1 || !validName(args[0]) {
+		return c.errf("usage: DELETE <name>")
+	}
+	if err := os.Remove(filepath.Join(c.srv.cfg.dir, args[0])); err != nil {
+		return c.errf("file not found")
+	}
+	log.Printf("[%s] deleted %s", c.remote, args[0])
+	return c.reply("OK")
 }
