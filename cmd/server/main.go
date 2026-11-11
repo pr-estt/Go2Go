@@ -13,6 +13,8 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
@@ -277,8 +279,8 @@ func (c *session) cmdList() error {
 }
 
 func (c *session) cmdUpload(args []string) error {
-	if len(args) != 2 {
-		return c.errf("usage: UPLOAD <name> <size>")
+	if len(args) != 3 {
+		return c.errf("usage: UPLOAD <name> <size> <sha256>")
 	}
 	name := args[0]
 	if !validName(name) {
@@ -290,6 +292,10 @@ func (c *session) cmdUpload(args []string) error {
 	}
 	if size > c.srv.cfg.maxSize {
 		return c.errf("file too large (max %d bytes)", c.srv.cfg.maxSize)
+	}
+	wantSum := strings.ToLower(args[2])
+	if b, err := hex.DecodeString(wantSum); err != nil || len(b) != sha256.Size {
+		return c.errf("invalid sha256")
 	}
 
 	// Write to a temp file first so readers never see partial uploads.
@@ -308,8 +314,13 @@ func (c *session) cmdUpload(args []string) error {
 	if err := c.reply("OK"); err != nil { // tell client it may send data
 		return err
 	}
-	if _, err := io.CopyN(tmp, c.r, size); err != nil {
+
+	h := sha256.New()
+	if _, err := io.CopyN(io.MultiWriter(tmp, h), c.r, size); err != nil {
 		return fmt.Errorf("receiving data: %w", err) // stream is broken; drop connection
+	}
+	if got := hex.EncodeToString(h.Sum(nil)); got != wantSum {
+		return c.errf("checksum mismatch")
 	}
 	if err := tmp.Sync(); err != nil {
 		return c.errf("cannot store file")
