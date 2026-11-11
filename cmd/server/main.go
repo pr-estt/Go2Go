@@ -21,7 +21,9 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -206,11 +208,14 @@ func (s *Server) handle(raw net.Conn) {
 		}
 		fields := strings.Fields(line)
 		cmd := strings.ToUpper(fields[0])
+		args := fields[1:]
 
 		var herr error // non-nil means the connection is unusable
 		switch cmd {
 		case "LIST":
 			herr = c.cmdList()
+		case "UPLOAD":
+			herr = c.cmdUpload(args)
 		case "QUIT":
 			c.reply("OK")
 			return
@@ -269,4 +274,70 @@ func (c *session) cmdList() error {
 	}
 	_, err = io.WriteString(c.w, payload)
 	return err
+}
+
+func (c *session) cmdUpload(args []string) error {
+	if len(args) != 2 {
+		return c.errf("usage: UPLOAD <name> <size>")
+	}
+	name := args[0]
+	if !validName(name) {
+		return c.errf("invalid file name")
+	}
+	size, err := strconv.ParseInt(args[1], 10, 64)
+	if err != nil || size < 0 {
+		return c.errf("invalid size")
+	}
+	if size > c.srv.cfg.maxSize {
+		return c.errf("file too large (max %d bytes)", c.srv.cfg.maxSize)
+	}
+
+	// Write to a temp file first so readers never see partial uploads.
+	tmp, err := os.CreateTemp(c.srv.cfg.dir, ".upload-*")
+	if err != nil {
+		return c.errf("cannot store file")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			tmp.Close()
+			os.Remove(tmp.Name())
+		}
+	}()
+
+	if err := c.reply("OK"); err != nil { // tell client it may send data
+		return err
+	}
+	if _, err := io.CopyN(tmp, c.r, size); err != nil {
+		return fmt.Errorf("receiving data: %w", err) // stream is broken; drop connection
+	}
+	if err := tmp.Sync(); err != nil {
+		return c.errf("cannot store file")
+	}
+	if err := tmp.Close(); err != nil {
+		return c.errf("cannot store file")
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return c.errf("cannot store file")
+	}
+	if err := os.Rename(tmp.Name(), filepath.Join(c.srv.cfg.dir, name)); err != nil {
+		return c.errf("cannot store file")
+	}
+	committed = true
+	log.Printf("[%s] uploaded %s (%d bytes)", c.remote, name, size)
+	return c.reply("OK")
+}
+
+// validName accepts only plain file names: no paths, no hidden files,
+// no whitespace/control characters (names are space-delimited on the wire).
+func validName(n string) bool {
+	if n == "" || len(n) > 255 || strings.HasPrefix(n, ".") {
+		return false
+	}
+	for _, r := range n {
+		if r < 0x21 || r == 0x7f || r == '/' || r == '\\' || r == ':' {
+			return false
+		}
+	}
+	return filepath.Base(n) == n
 }
