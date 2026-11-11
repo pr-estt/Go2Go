@@ -14,6 +14,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"errors"
 	"flag"
@@ -212,8 +213,15 @@ func (s *Server) handle(raw net.Conn) {
 		cmd := strings.ToUpper(fields[0])
 		args := fields[1:]
 
+		if !c.authed && cmd != "AUTH" && cmd != "QUIT" {
+			c.errf("authentication required")
+			continue
+		}
+
 		var herr error // non-nil means the connection is unusable
 		switch cmd {
+		case "AUTH":
+			herr = c.cmdAuth(args)
 		case "LIST":
 			herr = c.cmdList()
 		case "UPLOAD":
@@ -355,6 +363,19 @@ func validName(n string) bool {
 		}
 	}
 	return filepath.Base(n) == n
+}
+
+func (c *session) cmdAuth(args []string) error {
+	if c.srv.cfg.token == "" {
+		return c.reply("OK")
+	}
+	if len(args) != 1 ||
+		subtle.ConstantTimeCompare([]byte(args[0]), []byte(c.srv.cfg.token)) != 1 {
+		time.Sleep(500 * time.Millisecond) // slow down guessing
+		return c.errf("invalid token")
+	}
+	c.authed = true
+	return c.reply("OK")
 }
 
 func (c *session) cmdDownload(args []string) error {
