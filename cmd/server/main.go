@@ -1,28 +1,56 @@
 // Command server is a concurrent TCP file-transfer server.
+//
+// Protocol (text commands terminated by '\n', raw bytes for file data):
+//
+//	AUTH <token>                      -> OK | ERR <msg>      (only if -token is set)
+//	LIST                              -> OK <n>\n<n bytes of "name\tsize\n" lines>
+//	UPLOAD <name> <size> <sha256>     -> OK (ready) ... client sends <size> bytes ... -> OK | ERR <msg>
+//	DOWNLOAD <name>                   -> OK <size> <sha256>\n<size bytes> | ERR <msg>
+//	DELETE <name>                     -> OK | ERR <msg>
+//	QUIT                              -> OK (connection closes)
 package main
 
 import (
+	"bufio"
 	"context"
+	"errors"
 	"flag"
+	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 )
 
 type config struct {
-	addr     string
-	maxConns int
+	addr        string
+	dir         string
+	token       string
+	maxSize     int64
+	maxConns    int
+	idleTimeout time.Duration
 }
 
 func main() {
 	var cfg config
+	var maxSizeMB int64
 	flag.StringVar(&cfg.addr, "addr", ":9000", "listen address")
+	flag.StringVar(&cfg.dir, "dir", "./storage", "directory where files are stored")
+	flag.StringVar(&cfg.token, "token", "", "optional shared secret clients must present (AUTH)")
+	flag.Int64Var(&maxSizeMB, "max-size", 1024, "maximum upload size in MiB")
 	flag.IntVar(&cfg.maxConns, "max-conns", 100, "maximum concurrent connections")
+	flag.DurationVar(&cfg.idleTimeout, "idle", 60*time.Second, "close connection after this much I/O inactivity")
 	flag.Parse()
+	cfg.maxSize = maxSizeMB << 20
+
+	if err := os.MkdirAll(cfg.dir, 0o755); err != nil {
+		log.Fatalf("create storage dir: %v", err)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -48,7 +76,7 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	log.Printf("listening on %s", ln.Addr())
+	log.Printf("listening on %s, storing files in %s", ln.Addr(), s.cfg.dir)
 
 	// Stop accepting on shutdown signal.
 	go func() {
@@ -70,6 +98,10 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 			<-s.sem
 			if ctx.Err() != nil {
 				return s.shutdown()
+			}
+			var ne net.Error
+			if errors.As(err, &ne) && ne.Timeout() {
+				continue
 			}
 			log.Printf("accept error: %v", err)
 			time.Sleep(100 * time.Millisecond)
@@ -118,8 +150,95 @@ func (s *Server) track(c net.Conn, add bool) {
 	}
 }
 
-func (s *Server) handle(conn net.Conn) {
-	defer conn.Close()
-	log.Printf("[%s] connected", conn.RemoteAddr())
-	defer log.Printf("[%s] disconnected", conn.RemoteAddr())
+// timeoutConn refreshes the deadline before each Read/Write, giving an
+// inactivity timeout that works for transfers of any size.
+type timeoutConn struct {
+	net.Conn
+	timeout time.Duration
+}
+
+func (c timeoutConn) Read(p []byte) (int, error) {
+	c.Conn.SetReadDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Read(p)
+}
+
+func (c timeoutConn) Write(p []byte) (int, error) {
+	c.Conn.SetWriteDeadline(time.Now().Add(c.timeout))
+	return c.Conn.Write(p)
+}
+
+type session struct {
+	srv    *Server
+	conn   net.Conn
+	r      *bufio.Reader
+	w      io.Writer
+	authed bool
+	remote string
+}
+
+var errLineTooLong = errors.New("command line too long")
+
+func (s *Server) handle(raw net.Conn) {
+	defer raw.Close()
+	tc := timeoutConn{Conn: raw, timeout: s.cfg.idleTimeout}
+	c := &session{
+		srv:    s,
+		conn:   raw,
+		r:      bufio.NewReaderSize(tc, 4096),
+		w:      tc,
+		authed: s.cfg.token == "",
+		remote: raw.RemoteAddr().String(),
+	}
+	log.Printf("[%s] connected", c.remote)
+	defer log.Printf("[%s] disconnected", c.remote)
+
+	for {
+		line, err := c.readLine()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				log.Printf("[%s] read command: %v", c.remote, err)
+			}
+			return
+		}
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		cmd := strings.ToUpper(fields[0])
+
+		var herr error // non-nil means the connection is unusable
+		switch cmd {
+		case "QUIT":
+			c.reply("OK")
+			return
+		default:
+			herr = c.errf("unknown command %q", cmd)
+		}
+		if herr != nil {
+			log.Printf("[%s] %s failed: %v", c.remote, cmd, herr)
+			return
+		}
+	}
+}
+
+func (c *session) readLine() (string, error) {
+	line, err := c.r.ReadSlice('\n')
+	if err != nil {
+		if errors.Is(err, bufio.ErrBufferFull) {
+			return "", errLineTooLong
+		}
+		return "", err
+	}
+	return strings.TrimRight(string(line), "\r\n"), nil
+}
+
+func (c *session) reply(format string, a ...any) error {
+	_, err := fmt.Fprintf(c.w, format+"\n", a...)
+	return err
+}
+
+// errf sends an ERR line. The returned error is only a write failure.
+func (c *session) errf(format string, a ...any) error {
+	msg := strings.ReplaceAll(fmt.Sprintf(format, a...), "\n", " ")
+	return c.reply("ERR %s", msg)
 }
