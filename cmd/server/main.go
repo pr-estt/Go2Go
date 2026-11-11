@@ -218,6 +218,8 @@ func (s *Server) handle(raw net.Conn) {
 			herr = c.cmdList()
 		case "UPLOAD":
 			herr = c.cmdUpload(args)
+		case "DOWNLOAD":
+			herr = c.cmdDownload(args)
 		case "QUIT":
 			c.reply("OK")
 			return
@@ -351,4 +353,38 @@ func validName(n string) bool {
 		}
 	}
 	return filepath.Base(n) == n
+}
+
+func (c *session) cmdDownload(args []string) error {
+	if len(args) != 1 || !validName(args[0]) {
+		return c.errf("usage: DOWNLOAD <name>")
+	}
+	f, err := os.Open(filepath.Join(c.srv.cfg.dir, args[0]))
+	if err != nil {
+		return c.errf("file not found")
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return c.errf("file not found")
+	}
+
+	// Hash first so the checksum can go in the header.
+	h := sha256.New()
+	n, err := io.Copy(h, f)
+	if err != nil {
+		return c.errf("cannot read file")
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return c.errf("cannot read file")
+	}
+	if err := c.reply("OK %d %s", n, hex.EncodeToString(h.Sum(nil))); err != nil {
+		return err
+	}
+	// Send exactly n bytes (the file could grow while we send).
+	if _, err := io.CopyN(c.w, f, n); err != nil {
+		return fmt.Errorf("sending data: %w", err)
+	}
+	log.Printf("[%s] downloaded %s (%d bytes)", c.remote, args[0], n)
+	return nil
 }
