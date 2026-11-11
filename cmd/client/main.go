@@ -7,12 +7,15 @@ package main
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -26,6 +29,9 @@ func main() {
 
 Commands:
   list
+  upload   <local-path> [remote-name]
+  download <remote-name> [local-path]
+  delete   <remote-name>
 
 Flags:
 `, os.Args[0])
@@ -47,6 +53,32 @@ Flags:
 	switch strings.ToLower(args[0]) {
 	case "list":
 		err = c.list()
+	case "upload":
+		if len(args) < 2 || len(args) > 3 {
+			flag.Usage()
+			os.Exit(2)
+		}
+		remote := filepath.Base(args[1])
+		if len(args) == 3 {
+			remote = args[2]
+		}
+		err = c.upload(args[1], remote)
+	case "download":
+		if len(args) < 2 || len(args) > 3 {
+			flag.Usage()
+			os.Exit(2)
+		}
+		local := args[1]
+		if len(args) == 3 {
+			local = args[2]
+		}
+		err = c.download(args[1], local)
+	case "delete":
+		if len(args) != 2 {
+			flag.Usage()
+			os.Exit(2)
+		}
+		_, err = c.cmd("DELETE %s", args[1])
 	default:
 		flag.Usage()
 		os.Exit(2)
@@ -122,6 +154,85 @@ func (c *client) list() error {
 	}
 	_, err = io.CopyN(os.Stdout, c.r, n)
 	return err
+}
+
+func (c *client) upload(local, remote string) error {
+	f, err := os.Open(local)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", local)
+	}
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	size := info.Size()
+
+	// First OK = server accepted the header and is ready for data.
+	if _, err := c.cmd("UPLOAD %s %d %s", remote, size, hex.EncodeToString(h.Sum(nil))); err != nil {
+		return err
+	}
+	if _, err := io.CopyN(c.conn, f, size); err != nil {
+		return err
+	}
+	// Second OK = file stored and checksum verified.
+	_, err = c.readStatus()
+	if err == nil {
+		fmt.Printf("uploaded %s as %s (%d bytes)\n", local, remote, size)
+	}
+	return err
+}
+
+func (c *client) download(remote, local string) error {
+	f, err := c.cmd("DOWNLOAD %s", remote)
+	if err != nil {
+		return err
+	}
+	size, err := parseSize(f, 0)
+	if err != nil {
+		return err
+	}
+	if len(f) < 2 {
+		return errors.New("malformed server response")
+	}
+	wantSum := f[1]
+
+	tmp, err := os.CreateTemp(filepath.Dir(local), ".download-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name()) // no-op after successful rename
+	defer tmp.Close()
+
+	h := sha256.New()
+	if _, err := io.CopyN(io.MultiWriter(tmp, h), c.r, size); err != nil {
+		return err
+	}
+	if hex.EncodeToString(h.Sum(nil)) != wantSum {
+		return errors.New("checksum mismatch, download discarded")
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp.Name(), 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), local); err != nil {
+		return err
+	}
+	fmt.Printf("downloaded %s to %s (%d bytes)\n", remote, local, size)
+	return nil
 }
 
 func parseSize(fields []string, i int) (int64, error) {
