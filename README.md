@@ -1,6 +1,6 @@
 # go2go
 
-**go2do** is a simple, fast TCP file transfer server and client written in Go. Run the server on any machine, then upload, download, list and delete files from anywhere on the network using the bundled CLI, or from your own programs using a small text-based protocol.
+**go2go** is a simple, fast TCP file transfer server and client written in Go. Run the server on any machine, then upload, download, list and delete files from anywhere on the network using the bundled CLI, or from your own programs using a small text-based protocol.
 
 It uses only the Go standard library, so there are no dependencies to install and it builds into a single binary.
 
